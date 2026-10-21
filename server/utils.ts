@@ -520,15 +520,19 @@ export class IdleTimeoutError extends Error {
 }
 
 /**
- * Wraps an async iterable with an idle timeout. If no event is received
- * within `timeoutMs` milliseconds, throws an `IdleTimeoutError`.
+ * Wraps an async iterable with an idle timeout. If no qualifying event is
+ * received within `timeoutMs` milliseconds, throws an `IdleTimeoutError`.
  *
- * The timer resets on each received event, so long-running operations
- * that produce regular events will not be interrupted.
+ * By default the timer resets on each received event, so long-running
+ * operations that produce regular events will not be interrupted. Callers may
+ * supply `shouldResetTimeout` to ignore non-progress keepalive/retry events
+ * (such as internal `system:api_retry` loop ticks) so a stuck retry loop
+ * cannot keep resetting the deadline indefinitely.
  */
 export async function* withIdleTimeout<T>(
   events: AsyncIterable<T>,
   timeoutMs: number,
+  shouldResetTimeout: (event: T) => boolean = () => true,
 ): AsyncGenerator<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new RangeError(
@@ -536,11 +540,17 @@ export async function* withIdleTimeout<T>(
     );
   }
   const iterator = events[Symbol.asyncIterator]();
+  let deadlineAt = Date.now() + timeoutMs;
   try {
     while (true) {
-      const result = await nextBeforeIdleTimeout(iterator, timeoutMs);
+      const remainingMs = Math.max(1, deadlineAt - Date.now());
+      const result = await nextBeforeIdleTimeout(iterator, remainingMs, timeoutMs);
       if (result.done) break;
+      const resets = shouldResetTimeout(result.value);
       yield result.value;
+      if (resets) {
+        deadlineAt = Date.now() + timeoutMs;
+      }
     }
   } finally {
     // Fire-and-forget: don't await because the iterator may be stuck
@@ -552,13 +562,14 @@ export async function* withIdleTimeout<T>(
 
 async function nextBeforeIdleTimeout<T>(
   iterator: AsyncIterator<T>,
-  timeoutMs: number,
+  waitMs: number,
+  reportedTimeoutMs: number = waitMs,
 ): Promise<IteratorResult<T>> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   // Start requesting the next event before arming its idle deadline.
   const next = iterator.next();
   const deadline = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => reject(new IdleTimeoutError(timeoutMs)), timeoutMs);
+    timeoutId = setTimeout(() => reject(new IdleTimeoutError(reportedTimeoutMs)), waitMs);
   });
   try {
     return await Promise.race([next, deadline]);

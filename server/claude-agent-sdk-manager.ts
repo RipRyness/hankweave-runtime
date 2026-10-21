@@ -15,6 +15,7 @@ import {
   defaultProfileDefinesRegion,
   describeAmbientAwsCredentialSource,
   detectInstanceMetadataCredentials,
+  readCaseInsensitiveProfileStaticCredentials,
 } from "./aws-credentials.js";
 import { BaseProcessManager } from "./base-process-manager.js";
 import type { ClaudeLogParser } from "./claude-log-parser.js";
@@ -198,6 +199,26 @@ const BEDROCK_AWS_ENV_VARS = [
 export { BEDROCK_DEFAULT_REGION, describeAmbientAwsCredentialSource };
 
 /**
+ * Whether an SDK message represents real session/turn progress and should
+ * reset `withIdleTimeout`.
+ *
+ * When the Claude CLI's internal retry loop is stuck retrying a failed API or
+ * credential-chain call, it emits `system:api_error`, `system:api_retry`, and
+ * `system:status` (`status: "requesting"`) on each attempt. Treating those
+ * retry ticks as activity would perpetually reset `shimIdleTimeout` and allow
+ * an unrecoverable auth/IMDS hang to run for 10+ minutes.
+ */
+export function shouldResetSdkIdleTimeout(message: SDKMessage): boolean {
+  if (message.type === "system") {
+    const subtype = (message as { subtype?: string }).subtype;
+    if (subtype === "api_retry" || subtype === "api_error" || subtype === "status") {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * File-backed SessionStore adapter for the Claude Agent SDK.
  *
  * The SDK subprocess keeps its own transcript under the machine-local
@@ -355,7 +376,7 @@ export class ClaudeAgentSDKManager extends BaseProcessManager {
      * models (CLAUDE_CODE_USE_BEDROCK=1 + AWS credentials from the ambient
      * environment) instead of the Anthropic API.
      */
-    private bedrockMode: boolean = false,
+    private bedrockMode: boolean = true,
   ) {
     super(logger, logParser);
     this.promptBuilder = new PromptBuilder(
@@ -691,6 +712,56 @@ export class ClaudeAgentSDKManager extends BaseProcessManager {
           );
         }
       }
+      // If the active AWS profile in ~/.aws/credentials has uppercase INI keys
+      // (e.g. AWS_ACCESS_KEY_ID instead of aws_access_key_id), botocore (`aws`
+      // CLI) and our preflight accept them, but `@aws-sdk/credential-provider-ini`
+      // inside the Claude CLI requires lowercase keys and silently falls through
+      // to EC2 IMDS (169.254.169.254). Normalize them into env credentials so
+      // the child resolves via `fromEnv` instead of hanging on IMDS.
+      if (
+        !options.env.AWS_BEARER_TOKEN_BEDROCK &&
+        (options.env.AWS_PROFILE ||
+          !options.env.AWS_ACCESS_KEY_ID ||
+          !options.env.AWS_SECRET_ACCESS_KEY)
+      ) {
+        const profileCreds = readCaseInsensitiveProfileStaticCredentials(process.env);
+        if (profileCreds?.hadNonLowercaseKeys) {
+          options.env.AWS_ACCESS_KEY_ID = profileCreds.accessKeyId;
+          options.env.AWS_SECRET_ACCESS_KEY = profileCreds.secretAccessKey;
+          if (profileCreds.sessionToken) {
+            options.env.AWS_SESSION_TOKEN = profileCreds.sessionToken;
+          }
+          if (!options.env.AWS_REGION && !options.env.AWS_DEFAULT_REGION) {
+            options.env.AWS_REGION = profileCreds.region ?? BEDROCK_DEFAULT_REGION;
+          }
+          delete options.env.AWS_PROFILE;
+          this.logger.log(
+            `Normalized non-lowercase static credential keys from AWS profile "${profileCreds.profile}" into child env (AWS JS SDK requires lowercase INI keys).`,
+            "warn",
+          );
+        }
+      }
+      // When a non-IMDS ambient credential source is present (env, profile,
+      // ECS container credentials, or IRSA web identity), disable EC2 IMDS
+      // fallback unless the caller explicitly configured AWS_EC2_METADATA_DISABLED.
+      // In Bun (which the native Claude CLI is compiled with), node:http
+      // connect() to an unroutable link-local 169.254.169.254 ignores the 1s
+      // socket timeout and hangs until CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS.
+      if (
+        describeAmbientAwsCredentialSource() !== null &&
+        options.env.AWS_EC2_METADATA_DISABLED === undefined
+      ) {
+        options.env.AWS_EC2_METADATA_DISABLED = "true";
+      }
+      // Bound credential-chain resolution and internal retry count so broken
+      // AWS credentials fail fast instead of stalling for 11 minutes
+      // (11 attempts × 60s default chain timeout).
+      if (!options.env.CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS) {
+        options.env.CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS = "10000";
+      }
+      if (!options.env.CLAUDE_CODE_MAX_RETRIES) {
+        options.env.CLAUDE_CODE_MAX_RETRIES = "3";
+      }
       this.logger.log(
         `Bedrock mode: CLAUDE_CODE_USE_BEDROCK=1, region ${
           options.env.AWS_REGION ??
@@ -759,7 +830,7 @@ export class ClaudeAgentSDKManager extends BaseProcessManager {
 
       // Wrap with idle timeout if configured
       const events = shimIdleTimeout
-        ? withIdleTimeout(queryGenerator, shimIdleTimeout * 1000)
+        ? withIdleTimeout(queryGenerator, shimIdleTimeout * 1000, shouldResetSdkIdleTimeout)
         : queryGenerator;
       if (shimIdleTimeout) {
         this.logger.log(`[SDK-runQuery] Idle timeout enabled: ${shimIdleTimeout}s`, "info");
@@ -775,6 +846,27 @@ export class ClaudeAgentSDKManager extends BaseProcessManager {
         if (!this.sessionId) {
           this.sessionId = message.session_id;
           this.logger.log(`[SDK-runQuery] Session ID: ${this.sessionId}`, "debug");
+        }
+
+        // Surface internal SDK API retry/error messages in server.log so
+        // credential-chain or Bedrock throttling failures are never silent.
+        if (message.type === "system") {
+          const sys = message as Record<string, unknown>;
+          if (sys.subtype === "api_retry") {
+            const errDetail =
+              typeof sys.error === "object" && sys.error !== null
+                ? JSON.stringify(sys.error)
+                : String(sys.error ?? "unknown");
+            this.logger.log(
+              `[SDK-runQuery] API retry ${sys.attempt}/${sys.max_retries} for codon ${codonId} (status=${sys.error_status ?? "none"}, delay=${sys.retry_delay_ms ?? 0}ms, error=${errDetail})`,
+              "warn",
+            );
+          } else if (sys.subtype === "api_error") {
+            this.logger.log(
+              `[SDK-runQuery] API error for codon ${codonId}: ${JSON.stringify(sys.error ?? sys)}`,
+              "warn",
+            );
+          }
         }
 
         // Convert SDK message to JSONL format and write to log

@@ -1023,6 +1023,34 @@ describe("withIdleTimeout", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(returnCalled).toBe(true);
   });
+
+  test("does not reset deadline on events filtered by shouldResetTimeout", async () => {
+    // Emit non-progress retry events every 20ms forever; with a 55ms idle
+    // timeout and shouldResetTimeout returning false for "retry", the stream
+    // must time out instead of running forever.
+    async function* retryLoop(): AsyncGenerator<string> {
+      yield "init";
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        yield "retry";
+      }
+    }
+
+    const received: string[] = [];
+    let caught: unknown;
+    try {
+      for await (const item of withIdleTimeout(retryLoop(), 55, (e) => e !== "retry")) {
+        received.push(item);
+      }
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(IdleTimeoutError);
+    expect((caught as IdleTimeoutError).timeoutMs).toBe(55);
+    expect(received[0]).toBe("init");
+    expect(received.length).toBeLessThan(6);
+  });
 });
 
 describe("isSensitiveEnvKey", () => {

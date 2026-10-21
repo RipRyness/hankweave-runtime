@@ -60,6 +60,103 @@ function profileHasCredentialKeys(filePath: string, sectionNames: string[]): boo
   return profileHasKeys(filePath, sectionNames, AWS_PROFILE_CREDENTIAL_KEYS);
 }
 
+export interface NormalizedProfileStaticCredentials {
+  profile: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  region?: string;
+  hadNonLowercaseKeys: boolean;
+}
+
+function readProfileKeyValues(
+  filePath: string,
+  sectionNames: string[],
+): { lower: Map<string, string>; rawKeys: Set<string> } {
+  const lower = new Map<string, string>();
+  const rawKeys = new Set<string>();
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return { lower, rawKeys };
+  }
+  let inTarget = false;
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("[") && line.endsWith("]")) {
+      inTarget = sectionNames.includes(line.slice(1, -1).trim());
+      continue;
+    }
+    if (!inTarget || !line || line.startsWith("#") || line.startsWith(";")) continue;
+    const eqIdx = line.indexOf("=");
+    if (eqIdx <= 0) continue;
+    const rawKey = line.slice(0, eqIdx).trim();
+    const rawVal = line.slice(eqIdx + 1).trim();
+    if (rawKey && rawVal) {
+      rawKeys.add(rawKey);
+      lower.set(rawKey.toLowerCase(), rawVal);
+    }
+  }
+  return { lower, rawKeys };
+}
+
+/**
+ * Inspect the active AWS profile (`AWS_PROFILE` or `"default"`) in the shared
+ * credentials/config files for static credentials, and detect whether any of
+ * their INI keys are not strictly lowercase (e.g. `AWS_ACCESS_KEY_ID` instead
+ * of `aws_access_key_id`).
+ *
+ * Python botocore (`aws` CLI) and `profileHasCredentialKeys()` lowercase INI
+ * keys, whereas `@aws-sdk/credential-provider-ini` (`fromIni` inside the
+ * Claude Agent SDK child) checks `aws_access_key_id` and
+ * `aws_secret_access_key` case-sensitively and silently falls through to EC2
+ * IMDS (`169.254.169.254`) when they are uppercase.
+ */
+export function readCaseInsensitiveProfileStaticCredentials(
+  env: NodeJS.ProcessEnv = process.env,
+): NormalizedProfileStaticCredentials | null {
+  const credentialsFile =
+    env.AWS_SHARED_CREDENTIALS_FILE ?? path.join(os.homedir(), ".aws", "credentials");
+  const configFile = env.AWS_CONFIG_FILE ?? path.join(os.homedir(), ".aws", "config");
+  const profile = env.AWS_PROFILE || "default";
+  const configSections = env.AWS_PROFILE
+    ? [`profile ${env.AWS_PROFILE}`, env.AWS_PROFILE]
+    : ["default"];
+
+  const fromConfig = readProfileKeyValues(configFile, configSections);
+  const fromCreds = readProfileKeyValues(credentialsFile, [profile]);
+
+  const lower = new Map<string, string>();
+  const rawKeys = new Set<string>();
+  for (const src of [fromConfig, fromCreds]) {
+    for (const [k, v] of src.lower) lower.set(k, v);
+    for (const k of src.rawKeys) rawKeys.add(k);
+  }
+
+  const accessKeyId = lower.get("aws_access_key_id");
+  const secretAccessKey = lower.get("aws_secret_access_key");
+  if (!accessKeyId || !secretAccessKey) {
+    return null;
+  }
+
+  const sessionToken = lower.get("aws_session_token");
+  const region = lower.get("region");
+  const hadNonLowercaseKeys =
+    !rawKeys.has("aws_access_key_id") ||
+    !rawKeys.has("aws_secret_access_key") ||
+    (sessionToken !== undefined && !rawKeys.has("aws_session_token"));
+
+  return {
+    profile,
+    accessKeyId,
+    secretAccessKey,
+    ...(sessionToken ? { sessionToken } : {}),
+    ...(region ? { region } : {}),
+    hadNonLowercaseKeys,
+  };
+}
+
 /**
  * Whether any AWS credential *source* is visible: an explicit env credential,
  * container/web-identity creds, or a selected/default profile that actually

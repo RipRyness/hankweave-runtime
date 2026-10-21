@@ -5,12 +5,14 @@ import path from "node:path";
 import {
   defaultProfileDefinesRegion,
   detectInstanceMetadataCredentials,
+  readCaseInsensitiveProfileStaticCredentials,
 } from "../../server/aws-credentials";
 import {
   ClaudeAgentSDKManager,
   claudeSettingsDefineAwsCredentialHelpers,
   DEFAULT_SDK_IDLE_TIMEOUT_SECONDS,
   describeAmbientAwsCredentialSource,
+  shouldResetSdkIdleTimeout,
 } from "../../server/claude-agent-sdk-manager";
 import { ClaudeLogParser } from "../../server/claude-log-parser";
 import { classifyApiErrorText } from "../../server/error-classification";
@@ -469,5 +471,77 @@ describe("ClaudeAgentSDKManager idle timeout", () => {
     const manager = new ClaudeAgentSDKManager(tempDir, tempDir, logger, mockLogParser);
     // biome-ignore lint/suspicious/noExplicitAny: accessing private method for unit test
     await expect((manager as any).writeSyntheticErrorResult("boom")).resolves.toBeUndefined();
+  });
+
+  test("shouldResetSdkIdleTimeout ignores internal retry churn messages", () => {
+    expect(
+      shouldResetSdkIdleTimeout({ type: "system", subtype: "api_retry" } as never),
+    ).toBe(false);
+    expect(
+      shouldResetSdkIdleTimeout({ type: "system", subtype: "api_error" } as never),
+    ).toBe(false);
+    expect(
+      shouldResetSdkIdleTimeout({ type: "system", subtype: "status" } as never),
+    ).toBe(false);
+    expect(
+      shouldResetSdkIdleTimeout({ type: "system", subtype: "init" } as never),
+    ).toBe(true);
+    expect(
+      shouldResetSdkIdleTimeout({ type: "assistant", message: {} } as never),
+    ).toBe(true);
+  });
+
+  test("buildSDKOptions in Bedrock mode disables IMDS when ambient credentials exist and normalizes uppercase INI keys", async () => {
+    const awsDir = fs.mkdtempSync(path.join(os.tmpdir(), "sdk-bedrock-env-"));
+    const saved: Record<string, string | undefined> = {};
+    const keys = [
+      "AWS_SHARED_CREDENTIALS_FILE",
+      "AWS_CONFIG_FILE",
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_SESSION_TOKEN",
+      "AWS_PROFILE",
+      "AWS_EC2_METADATA_DISABLED",
+      "CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS",
+      "CLAUDE_CODE_MAX_RETRIES",
+    ];
+    for (const k of keys) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    try {
+      process.env.AWS_SHARED_CREDENTIALS_FILE = path.join(awsDir, "credentials");
+      process.env.AWS_CONFIG_FILE = path.join(awsDir, "config");
+      fs.writeFileSync(
+        path.join(awsDir, "credentials"),
+        "[default]\nAWS_ACCESS_KEY_ID = AKIAUPPER\nAWS_SECRET_ACCESS_KEY = secretupper\n",
+      );
+      expect(readCaseInsensitiveProfileStaticCredentials()?.hadNonLowercaseKeys).toBe(true);
+
+      const manager = new ClaudeAgentSDKManager(tempDir, tempDir, logger, mockLogParser);
+      // biome-ignore lint/suspicious/noExplicitAny: accessing private method for unit test
+      const options = await (manager as any).buildSDKOptions(
+        {
+          id: "test-codon",
+          name: "Test",
+          model: { modelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
+          continuationMode: "fresh",
+        },
+        null,
+      );
+
+      expect(options.env.CLAUDE_CODE_USE_BEDROCK).toBe("1");
+      expect(options.env.AWS_ACCESS_KEY_ID).toBe("AKIAUPPER");
+      expect(options.env.AWS_SECRET_ACCESS_KEY).toBe("secretupper");
+      expect(options.env.AWS_EC2_METADATA_DISABLED).toBe("true");
+      expect(options.env.CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS).toBe("10000");
+      expect(options.env.CLAUDE_CODE_MAX_RETRIES).toBe("3");
+    } finally {
+      for (const k of keys) {
+        if (saved[k] !== undefined) process.env[k] = saved[k];
+        else delete process.env[k];
+      }
+      rmSync(awsDir, { recursive: true, force: true });
+    }
   });
 });
